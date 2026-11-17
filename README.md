@@ -14,7 +14,7 @@ Aligned with the Standard Agent Specification (v0.2.0)
 
 ![Polygentic workspace](docs/screenshots/07-workspace.png)
 
-This README covers what Polygentic is, how its multi-agent pipeline works, the design system it runs on, a page-by-page specification with screenshots, and where the platform goes next. The original design document is in [`Polygentic-Design-README.pdf`](Polygentic-Design-README.pdf).
+This README covers what Polygentic is, how its multi-agent pipeline works, the design system it runs on, a page-by-page specification with screenshots, and where the platform goes next.
 
 > **Try it live:** run the app (see [Running the app](#2-running-the-app)) and sign in with the one-click demo account — `demo@polygentic.dev` / `demo1234`. It comes pre-loaded with showcase workspaces, routines, and connected integrations. To watch the whole pipeline end to end, type a prompt on Home and press **Plan with Agent**: the classifier tags it and the decision form arrives in seconds.
 
@@ -101,6 +101,22 @@ bun prisma/seed.ts   # optional: reset + load the demo account & showcase data
 
 **Tech:** Next.js 16 (App Router, Turbopack) · React 19 · Tailwind CSS 4 · shadcn/ui + Radix · Prisma + SQLite · GraphQL (executable schema) · SSE streaming. See [§11](#11-technical-architecture).
 
+### Repository layout
+
+```
+src/lib/agents/models.ts       model registry: tiers, context windows, credits, capabilities
+src/lib/agents/routing.ts      stage → model table, fallback chains, overrides, plan snapshot
+src/lib/agents/run-stage.ts    runs a stage across its chain, then its deterministic fallback
+src/lib/graphql/routing.ts     agentRouting + availableModels schema slice
+docs/screenshots/              product screenshots used below
+```
+
+```bash
+npm install        # dev dependencies (TypeScript, Node types)
+npm test           # node --test over src/**/*.test.ts (Node ≥ 22.18, runs .ts directly)
+npm run typecheck  # tsc --noEmit
+```
+
 ---
 
 ## 3. The agent pipeline — how a prompt becomes a verified artifact
@@ -117,6 +133,21 @@ This is the heart of the platform. Four specialized agent stages, each with its 
 | **Verifier** | `glm-4.7-air` | — | Runs the structural checks and the build gate (the checks themselves are deterministic — no model call) |
 
 Every stage has a **deterministic fallback**, so a model failure degrades the plan, never the session: the classifier falls back to keyword heuristics; grounding falls back to a guaranteed baseline (type blueprint + interview craft + verification convention); the form falls back to a per-type question bank; the editor gets a verifier-driven corrective round. The stream surfaces these honestly with `planner_retry` and `planner_fallback` notices.
+
+**How routing resolves** ([`src/lib/agents/routing.ts`](src/lib/agents/routing.ts)):
+
+| Stage | Chain | Attempts | Requires | Then |
+|---|---|---|---|---|
+| Classifier | `glm-4.7-air` → `glm-4.7` | 1 | JSON mode | keyword heuristics |
+| Planner · Interviewer | `glm-4.7` → `glm-4.6` | 2 | reasoning, tool use | per-type question bank |
+| Editor | `glm-4.7` → `glm-4.6` | 2 | tool use | stage fails; structural gaps go to the corrective round |
+| Verifier | — | 0 | — | deterministic 5-check gate |
+
+- **Overrides** (the Home model selector, or `POLYGENTIC_MODEL_<STAGE>` env vars) go to the front of a stage's chain. An override that is unavailable or lacks a required capability is rejected and reported as a typed `RoutingIssue`; the default chain still runs.
+- **Availability** filters the chain, so an outage of a model automatically skips it.
+- **Attempts** walk the chain; each failed call or rejected parse is fed back into the next attempt's prompt. A cancelled request is never retried.
+- **Provenance:** `snapshotRouting()` produces the JSON stored on `Plan.routing`, versioned by `ROUTING_VERSION`.
+- **Providers** plug in through the `ModelClient` interface in [`src/lib/agents/run-stage.ts`](src/lib/agents/run-stage.ts).
 
 The **Planner is sandboxed**: its system prompt forbids creating, editing, or deleting files and running commands. Its only output channel is the `submit_plan` pseudo-tool — the same tool-block protocol the editor uses, but intercepted by the plan endpoint and never executed against the workspace.
 
@@ -635,7 +666,7 @@ Knowledge cards and the routing table are **code-versioned, not rows** — the p
 - **Tools (8):** `list_files`, `read_file`, `create_file`, `edit_file`, `delete_file`, `run_command`, `create_checkpoint`, `submit_plan` — invoked through a fenced `<<<TOOL {json} TOOL>>>` block protocol with lenient fallbacks, and a stream guard that holds back text at potential tool-call starts so tool JSON never leaks into the visible stream.
 - **Runner:** a bounded model → tool → model loop (≤ 6 rounds for the editor, ≤ 5 for a corrective round, ≤ 4 in Build Mode) with per-stage model selection and tool allowlists. After any file-mutating round it auto-checkpoints the workspace.
 - **Prompts:** per-stage system prompts — the classifier's ("reply with exactly one JSON object"), the planner's (sandbox declaration + knowledge cards + the `submit_plan` contract), the editor's (blueprint directives + definition-of-done + "never describe files in prose — every file must be a `create_file` tool call").
-- **Routing:** a fixed stage → model table (see [§3.1](#31-stages-and-model-routing)), exposed through the `agentRouting` query and snapshotted onto every plan.
+- **Routing:** a fixed stage → model table with per-stage fallback chains (see [§3.1](#31-stages-and-model-routing) and [`src/lib/agents/routing.ts`](src/lib/agents/routing.ts)), exposed through the `agentRouting` query and snapshotted onto every plan.
 - **Shell:** the terminal pane runs against the same DB state the agents mutate (`ls`, `tree`, `cat`, `npm`, `git status/log` — checkpoints render as pseudo-commits), so the shell, the file tree, and the agents can never disagree.
 
 ### 11.4 The knowledge repo
